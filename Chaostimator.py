@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Chaostimator.py
-Deterministic Chaos Orb Outcome Estimator (Tkinter)
-- Weighted mods
-- Prefix / Suffix distinction (type column: 1 = prefix, 2 = suffix)
-- Random prefix/suffix split per roll (4-6 affixes, max 3 each)
-- Deterministic Monte Carlo (same inputs -> same result)
+Chaostimator.py - Final corrected version
+- Thresholds are treated as minimums (>=)
+- Weighted prefix/suffix selection (type: 1=prefix,2=suffix or text)
+- Total affixes: 4-6 with 8:3:1 weighting
+- Random prefix/suffix split per roll, max 3 each
+- Deterministic RNG (fixed seed) so repeated runs produce same estimate
 - Auto-load data.xlsx from same folder
-- Mod column left-aligned, shows only first line of multiline names
-- Filter restores full list when cleared
-- Results shown bold + average Chaos Orbs needed
+- GUI: left-aligned Mod column, show first line of multiline names, filter restores full list
+- Results: bold, display probability (3 decimals) and average chaos (ceil)
 """
 
 import threading
@@ -18,46 +17,43 @@ from tkinter import ttk, filedialog, messagebox, font as tkfont
 import pandas as pd
 import numpy as np
 import os
-import hashlib
 import math
-import json
 
-# INTERNAL CONSTANTS
-DEFAULT_ITERATIONS = 2_000  # hidden from UI, used internally
-BATCH = 1000  # update progress in batches
+# Internal constants
+DEFAULT_ITERATIONS = 2_000  # internal Monte Carlo iterations
+BATCH = 1000  # progress batch size
+FIXED_RNG_SEED = 1337  # deterministic seed for reproducible runs
 
 
 # -----------------------------
 # Monte Carlo worker (thread)
 # -----------------------------
 class SimulationWorker(threading.Thread):
-    def __init__(self, mods_df, thresholds, iterations, progress_callback, done_callback, stop_event, seed_int):
+    def __init__(self, mods_df, thresholds, iterations, progress_callback, done_callback, stop_event):
         super().__init__(daemon=True)
-        # copy minimal, normalized DataFrame for thread-safety
+        # keep a copy of the filtered mods for thread safety
         self.mods_df = mods_df.copy().reset_index(drop=True)
         self.thresholds = thresholds
         self.iterations = int(iterations)
         self.progress_callback = progress_callback
         self.done_callback = done_callback
         self.stop_event = stop_event
-        self.seed_int = int(seed_int) & 0xFFFFFFFF
 
     def run(self):
         try:
-            # Use a local Generator seeded deterministically for reproducible results
-            rng = np.random.default_rng(self.seed_int)
+            rng = np.random.default_rng(FIXED_RNG_SEED)
 
             cols = ["quantity", "rarity", "pack_size", "currency", "scarabs", "maps"]
-            thresholds_arr = np.array([self.thresholds[c] for c in cols], dtype=float)
+            thresholds_arr = np.array([self.thresholds.get(c, 0.0) for c in cols], dtype=float)
 
             prefixes_df = self.mods_df[self.mods_df["type"] == "prefix"].reset_index(drop=True)
             suffixes_df = self.mods_df[self.mods_df["type"] == "suffix"].reset_index(drop=True)
 
-            # Prepare weights arrays (if empty, we'll handle later)
+            # prepare weights (normalized) for both lists; if empty keep None
             if len(prefixes_df) > 0:
                 p_w = prefixes_df.get("weight", pd.Series(1, index=prefixes_df.index)).to_numpy(dtype=float)
                 p_w = np.clip(p_w, 0.0, None)
-                if p_w.sum() == 0:
+                if p_w.sum() == 0.0:
                     p_w[:] = 1.0
                 p_w = p_w / p_w.sum()
             else:
@@ -66,7 +62,7 @@ class SimulationWorker(threading.Thread):
             if len(suffixes_df) > 0:
                 s_w = suffixes_df.get("weight", pd.Series(1, index=suffixes_df.index)).to_numpy(dtype=float)
                 s_w = np.clip(s_w, 0.0, None)
-                if s_w.sum() == 0:
+                if s_w.sum() == 0.0:
                     s_w[:] = 1.0
                 s_w = s_w / s_w.sum()
             else:
@@ -80,55 +76,48 @@ class SimulationWorker(threading.Thread):
             completed = 0
             iters = self.iterations
 
-            # Run simulation in batches to update progress
             while completed < iters and not self.stop_event.is_set():
                 current = min(BATCH, iters - completed)
-                # draw roll sizes (deterministic RNG)
                 ks = rng.choice(roll_sizes, size=current, p=roll_probs)
                 totals = np.zeros((current, len(cols)), dtype=float)
 
                 for i, k in enumerate(ks):
-                    # Determine random split prefix/suffix with max 3 each
-                    max_prefix = min(3, k)
-                    max_suffix = min(3, k)
-                    possible_splits = [(p, k - p) for p in range(0, k + 1) if p <= max_prefix and (k - p) <= max_suffix]
-                    # choose a split uniformly among valid splits
-                    prefix_count, suffix_count = possible_splits[rng.integers(len(possible_splits))]
+                    # compute valid splits p + s = k with caps of 3
+                    max_p = min(3, k)
+                    max_s = min(3, k)
+                    splits = [(p, k - p) for p in range(0, k + 1) if p <= max_p and (k - p) <= max_s]
+                    prefix_count, suffix_count = splits[rng.integers(len(splits))]
 
-                    sum_vector = np.zeros(len(cols), dtype=float)
+                    sum_vec = np.zeros(len(cols), dtype=float)
 
-                    # sample prefixes
+                    # sample prefixes (without replacement) respecting available pool
                     if prefix_count > 0 and len(prefixes_df) > 0:
-                        sample_count = min(prefix_count, len(prefixes_df))
-                        # choose without replacement using p_w (if sample_count == len -> take all)
-                        if sample_count == len(prefixes_df):
-                            sel_idx = np.arange(len(prefixes_df))
+                        take = min(prefix_count, len(prefixes_df))
+                        if take == len(prefixes_df):
+                            sel = np.arange(len(prefixes_df))
                         else:
-                            sel_idx = rng.choice(len(prefixes_df), size=sample_count, replace=False, p=p_w)
-                        # sum chosen prefix stats
-                        sum_vector += prefixes_df.iloc[sel_idx][cols].sum(axis=0).to_numpy(dtype=float)
+                            sel = rng.choice(len(prefixes_df), size=take, replace=False, p=p_w)
+                        sum_vec += prefixes_df.iloc[sel][cols].sum(axis=0).to_numpy(dtype=float)
 
                     # sample suffixes
                     if suffix_count > 0 and len(suffixes_df) > 0:
-                        sample_count = min(suffix_count, len(suffixes_df))
-                        if sample_count == len(suffixes_df):
-                            sel_idx = np.arange(len(suffixes_df))
+                        take = min(suffix_count, len(suffixes_df))
+                        if take == len(suffixes_df):
+                            sel = np.arange(len(suffixes_df))
                         else:
-                            sel_idx = rng.choice(len(suffixes_df), size=sample_count, replace=False, p=s_w)
-                        sum_vector += suffixes_df.iloc[sel_idx][cols].sum(axis=0).to_numpy(dtype=float)
+                            sel = rng.choice(len(suffixes_df), size=take, replace=False, p=s_w)
+                        sum_vec += suffixes_df.iloc[sel][cols].sum(axis=0).to_numpy(dtype=float)
 
-                    totals[i, :] = sum_vector
+                    totals[i, :] = sum_vec
 
-                # count successes for this batch
+                # count successes where all thresholds are met (>=)
                 successes += int((totals >= thresholds_arr).all(axis=1).sum())
                 completed += current
 
-                # progress callback (0-100)
                 if self.progress_callback:
                     pct = int(completed / iters * 100)
                     self.progress_callback(pct)
 
-            # cancelled?
             if self.stop_event.is_set():
                 if self.done_callback:
                     self.done_callback(None, cancelled=True)
@@ -138,9 +127,9 @@ class SimulationWorker(threading.Thread):
             if self.done_callback:
                 self.done_callback(probability, cancelled=False)
 
-        except Exception as exc:
+        except Exception as e:
             if self.done_callback:
-                self.done_callback(exc, error=True)
+                self.done_callback(e, error=True)
 
 
 # -----------------------------
@@ -156,8 +145,6 @@ class ChaosOrbApp(tk.Tk):
         self.worker = None
         self.stop_event = threading.Event()
         self._build_ui()
-
-        # Auto-load data.xlsx from same folder
         self.auto_load_excel()
 
     # -----------------------------
@@ -185,26 +172,24 @@ class ChaosOrbApp(tk.Tk):
             messagebox.showerror("Error", f"Failed to load Excel:\n{e}")
             return
 
-        # Required columns & defaults
+        # required columns and defaults
         needed = ["mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"]
         for c in needed:
             if c not in df.columns:
                 df[c] = 1 if c == "weight" else 0
 
-        # Normalize columns
+        # normalize columns
         df["mod"] = df["mod"].astype(str)
 
-        # Convert type: accept 1/2 or text; map to 'prefix'/'suffix'
+        # type mapping: accept 1/2 or text
         df["type"] = df["type"].astype(str).str.strip().str.lower()
         df["type"] = df["type"].replace({"1": "prefix", "2": "suffix", "prefix": "prefix", "suffix": "suffix"})
-        # Any invalid entries default to prefix (safer)
         df.loc[~df["type"].isin(["prefix", "suffix"]), "type"] = "prefix"
 
-        # Numeric coercion
+        # numeric coercion
         for c in ["quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(1 if c == "weight" else 0)
 
-        # Save normalized dataframe
         self.mods_df = df[needed].reset_index(drop=True)
         if "excluded" not in self.mods_df.columns:
             self.mods_df["excluded"] = False
@@ -216,12 +201,11 @@ class ChaosOrbApp(tk.Tk):
     # Populate tree
     # -----------------------------
     def populate_tree(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        for it in self.tree.get_children():
+            self.tree.delete(it)
         if self.mods_df is None:
             return
         for i, row in self.mods_df.iterrows():
-            # Only show first line of multiline mod names
             mod_display = str(row["mod"]).splitlines()[0]
             values = (
                 "", mod_display, row["type"],
@@ -229,7 +213,6 @@ class ChaosOrbApp(tk.Tk):
                 str(row["currency"]), str(row["scarabs"]), str(row["maps"]), str(row["weight"])
             )
             self.tree.insert("", "end", iid=str(i), values=values)
-        # bind double click after items are present
         self.tree.bind("<Double-1>", self._on_tree_double_click)
 
     def _on_tree_double_click(self, event):
@@ -281,15 +264,13 @@ class ChaosOrbApp(tk.Tk):
         self.load_btn = ttk.Button(top, text="Load Mods Excel", command=self.load_excel)
         self.load_btn.pack(side="left")
 
-        # Removed iterations & seed inputs per request (fixed internal iterations)
         self.save_btn = ttk.Button(top, text="Save Filtered Mods", command=self.save_filtered_mods)
         self.save_btn.pack(side="right")
 
-        # Middle split
         middle = ttk.Panedwindow(self, orient="horizontal")
         middle.pack(side="top", fill="both", expand=True, padx=8, pady=8)
 
-        # Left: tree + filter
+        # left: tree + filter
         left_frame = ttk.Frame(middle, width=800)
         middle.add(left_frame, weight=3)
 
@@ -307,9 +288,8 @@ class ChaosOrbApp(tk.Tk):
         self.tree = ttk.Treeview(left_frame, columns=cols, show="headings", selectmode="browse")
         for c in cols:
             self.tree.heading(c, text=c)
-            # Left-align mod text
             if c == "Mod":
-                self.tree.column(c, width=360, anchor="w")
+                self.tree.column(c, width=360, anchor="w")  # left-align mod name
             else:
                 self.tree.column(c, width=90, anchor="center")
         vsb = ttk.Scrollbar(left_frame, orient="vertical", command=self.tree.yview)
@@ -317,7 +297,7 @@ class ChaosOrbApp(tk.Tk):
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        # Right frame: thresholds, run/cancel, results
+        # right: thresholds + controls + results
         right_frame = ttk.Frame(middle, width=400)
         middle.add(right_frame, weight=1)
 
@@ -342,14 +322,12 @@ class ChaosOrbApp(tk.Tk):
         self.progress = ttk.Progressbar(right_frame, orient="horizontal", mode="determinate")
         self.progress.pack(fill="x", padx=6, pady=(6, 0))
 
-        # Results area with bold font
         res_group = ttk.LabelFrame(right_frame, text="Results")
         res_group.pack(fill="both", expand=True, padx=6, pady=6)
-        bold_font = tkfont.Font(size=11, weight="bold")
+        bold_font = tkfont.Font(size=12, weight="bold")
         self.result_label = tk.Label(res_group, text="No results yet.", wraplength=360, justify="left", font=bold_font, anchor="nw")
         self.result_label.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # status bar
         self.status_var = tk.StringVar(value="Ready.")
         status_label = ttk.Label(self, textvariable=self.status_var, anchor="w")
         status_label.pack(side="bottom", fill="x", padx=8, pady=6)
@@ -361,7 +339,8 @@ class ChaosOrbApp(tk.Tk):
         if self.mods_df is None:
             messagebox.showwarning("No data", "Please load an Excel file before running.")
             return
-        # read thresholds
+
+        # parse thresholds (user may leave some as 0)
         try:
             thresholds = {k: float(v.get()) for k, v in self.threshold_vars.items()}
         except Exception:
@@ -373,17 +352,14 @@ class ChaosOrbApp(tk.Tk):
             messagebox.showwarning("No mods", "All mods excluded or no mods available after filtering.")
             return
 
-        # compute deterministic seed from filtered mods + thresholds
-        seed_int = self._compute_deterministic_seed(df_filtered, thresholds)
-
-        # disable UI
+        # disable UI controls
         self.run_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self.progress["value"] = 0
         self.status_var.set("Simulation running...")
 
         self.stop_event.clear()
-        self.worker = SimulationWorker(df_filtered, thresholds, DEFAULT_ITERATIONS, self._on_progress, self._on_done, self.stop_event, seed_int)
+        self.worker = SimulationWorker(df_filtered, thresholds, DEFAULT_ITERATIONS, self._on_progress, self._on_done, self.stop_event)
         self.worker.start()
 
     def cancel_simulation(self):
@@ -392,7 +368,6 @@ class ChaosOrbApp(tk.Tk):
             self.status_var.set("Cancelling...")
 
     def _on_progress(self, pct):
-        # schedule on main thread
         self.after(0, lambda: self.progress.config(value=pct))
 
     def _on_done(self, result, cancelled=False, error=False):
@@ -407,44 +382,17 @@ class ChaosOrbApp(tk.Tk):
                 self.status_var.set("Error during simulation")
                 messagebox.showerror("Error", f"Simulation error:\n{result}")
                 return
+
             prob = float(result)
+            prob_pct = prob * 100.0
+            if prob > 0:
+                avg = math.ceil(1.0 / prob)
+            else:
+                avg = "∞"
             self.progress["value"] = 100
             self.status_var.set("Simulation finished.")
-            # format probability as percent with 3 decimals
-            prob_percent = prob * 100.0
-            if prob > 0:
-                avg_orbs = math.ceil(1.0 / prob)
-            else:
-                avg_orbs = "∞"
-            self.result_label.config(text=f"Estimated probability per Chaos Orb roll: {prob_percent:.3f}%\nAverage Chaos Orbs Needed (expected): {avg_orbs}")
+            self.result_label.config(text=f"Estimated probability per Chaos Orb roll: {prob_pct:.3f}%\nAverage Chaos Orbs Needed (expected): {avg}")
         self.after(0, ui_update)
-
-    # -----------------------------
-    # Utilities
-    # -----------------------------
-    def _compute_deterministic_seed(self, df: pd.DataFrame, thresholds: dict) -> int:
-        """
-        Create a deterministic integer seed from the filtered mods + thresholds.
-        This ensures repeated runs with the same inputs produce identical results.
-        """
-        # build a compact, stable JSON representation:
-        # include mod name, type, weight and numeric stat columns; sort rows for stability
-        df_small = df[["mod", "type", "weight", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps"]].copy()
-        # round floats to limited precision for stability
-        df_small[["weight", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps"]] = df_small[
-            ["weight", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps"]
-        ].round(6)
-        # sort rows by mod name + type to make order-independent
-        df_small = df_small.sort_values(by=["mod", "type"]).reset_index(drop=True)
-        payload = {
-            "mods": df_small.to_dict(orient="records"),
-            "thresholds": {k: float(v) for k, v in sorted(thresholds.items())}
-        }
-        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        # hash to 32-bit int
-        h = hashlib.md5(raw.encode("utf-8")).hexdigest()
-        seed_int = int(h[:8], 16)  # take first 8 hex digits -> 32-bit
-        return seed_int
 
     def save_filtered_mods(self):
         df = self.get_filtered_mods()
@@ -459,6 +407,14 @@ class ChaosOrbApp(tk.Tk):
             messagebox.showinfo("Saved", f"Saved {len(df)} mods to {path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save file:\n{e}")
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def get_filtered_mods(self):
+        if self.mods_df is None:
+            return pd.DataFrame(columns=["mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"])
+        return self.mods_df[~self.mods_df["excluded"]].reset_index(drop=True)
 
 
 # -----------------------------

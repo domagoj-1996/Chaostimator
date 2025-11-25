@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Chaostimator.py - Final corrected version
-- Thresholds are treated as minimums (>=)
-- Weighted prefix/suffix selection (type: 1=prefix,2=suffix or text)
-- Total affixes: 4-6 with 8:3:1 weighting
-- Random prefix/suffix split per roll, max 3 each
-- Deterministic RNG (fixed seed) so repeated runs produce same estimate
-- Auto-load data.xlsx from same folder
-- GUI: left-aligned Mod column, show first line of multiline names, filter restores full list
-- Results: bold, display probability (3 decimals) and average chaos (ceil)
-"""
 
 import threading
 import tkinter as tk
@@ -20,8 +9,8 @@ import os
 import math
 
 # Internal constants
-DEFAULT_ITERATIONS = 2_000  # internal Monte Carlo iterations
-BATCH = 1000  # progress batch size
+DEFAULT_ITERATIONS = 2_000  # internal Monte Carlo iterations (changed per request)
+BATCH = 200  # progress batch size (smaller since iterations lower)
 FIXED_RNG_SEED = 1337  # deterministic seed for reproducible runs
 
 
@@ -44,6 +33,7 @@ class SimulationWorker(threading.Thread):
             rng = np.random.default_rng(FIXED_RNG_SEED)
 
             cols = ["quantity", "rarity", "pack_size", "currency", "scarabs", "maps"]
+            # Ensure thresholds order matches cols
             thresholds_arr = np.array([self.thresholds.get(c, 0.0) for c in cols], dtype=float)
 
             prefixes_df = self.mods_df[self.mods_df["type"] == "prefix"].reset_index(drop=True)
@@ -110,7 +100,7 @@ class SimulationWorker(threading.Thread):
 
                     totals[i, :] = sum_vec
 
-                # count successes where all thresholds are met (>=)
+                # count successes where ALL thresholds are met (>=)
                 successes += int((totals >= thresholds_arr).all(axis=1).sum())
                 completed += current
 
@@ -201,18 +191,21 @@ class ChaosOrbApp(tk.Tk):
     # Populate tree
     # -----------------------------
     def populate_tree(self):
+        # clear tree
         for it in self.tree.get_children():
             self.tree.delete(it)
         if self.mods_df is None:
             return
         for i, row in self.mods_df.iterrows():
             mod_display = str(row["mod"]).splitlines()[0]
+            excl = "X" if bool(row.get("excluded", False)) else ""
             values = (
-                "", mod_display, row["type"],
+                excl, mod_display, row["type"],
                 str(row["quantity"]), str(row["rarity"]), str(row["pack_size"]),
                 str(row["currency"]), str(row["scarabs"]), str(row["maps"]), str(row["weight"])
             )
             self.tree.insert("", "end", iid=str(i), values=values)
+        # bind double click
         self.tree.bind("<Double-1>", self._on_tree_double_click)
 
     def _on_tree_double_click(self, event):
@@ -230,24 +223,40 @@ class ChaosOrbApp(tk.Tk):
     # -----------------------------
     def apply_filter(self):
         txt = self.filter_var.get().strip().lower()
-        for iid in self.tree.get_children():
-            modname = self.mods_df.loc[int(iid), "mod"].splitlines()[0].lower()
-            if txt == "" or txt in modname:
-                try:
-                    self.tree.reattach(iid, "", "end")
-                except Exception:
-                    pass
-            else:
-                self.tree.detach(iid)
+
+        # If filter is empty → show the full list again
+        if txt == "":
+            self.populate_tree()   # rebuild from original DataFrame
+            return
+
+        # Otherwise → build only filtered rows
+        self.tree.delete(*self.tree.get_children())
+
+        for idx, row in self.mods_df.iterrows():
+            name = row["mod"].splitlines()[0].lower()
+            if txt in name:
+                self.tree.insert(
+                    "",
+                    "end",
+                    iid=str(idx),
+                    values=(
+                        row["mod"].splitlines()[0],
+                        row["type"],
+                        row["quantity"],
+                        row["rarity"],
+                        row["packsize"],
+                        row["currency"],
+                        row["scarabs"],
+                        row["maps"],
+                    )
+                )
 
     def clear_exclusions(self):
         if self.mods_df is None:
             return
         self.mods_df["excluded"] = False
-        for iid in self.tree.get_children():
-            curvals = list(self.tree.item(iid, "values"))
-            curvals[0] = ""
-            self.tree.item(iid, values=curvals)
+        # refresh display to clear marks
+        self.populate_tree()
 
     def get_filtered_mods(self):
         if self.mods_df is None:

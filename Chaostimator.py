@@ -8,19 +8,16 @@ import numpy as np
 import os
 import math
 
-# Internal constants
-DEFAULT_ITERATIONS = 2_000  # internal Monte Carlo iterations (changed per request)
-BATCH = 200  # progress batch size (smaller since iterations lower)
-FIXED_RNG_SEED = 1337  # deterministic seed for reproducible runs
+# --- Config ---
+DEFAULT_ITERATIONS = 2_000
+BATCH = 200
+FIXED_RNG_SEED = 1337
 
-
-# -----------------------------
-# Monte Carlo worker (thread)
-# -----------------------------
+# --- Monte Carlo worker ---
 class SimulationWorker(threading.Thread):
     def __init__(self, mods_df, thresholds, iterations, progress_callback, done_callback, stop_event):
         super().__init__(daemon=True)
-        # keep a copy of the filtered mods for thread safety
+        # thread-safe copy
         self.mods_df = mods_df.copy().reset_index(drop=True)
         self.thresholds = thresholds
         self.iterations = int(iterations)
@@ -33,15 +30,14 @@ class SimulationWorker(threading.Thread):
             rng = np.random.default_rng(FIXED_RNG_SEED)
 
             cols = ["quantity", "rarity", "pack_size", "currency", "scarabs", "maps"]
-            # Ensure thresholds order matches cols
             thresholds_arr = np.array([self.thresholds.get(c, 0.0) for c in cols], dtype=float)
 
             prefixes_df = self.mods_df[self.mods_df["type"] == "prefix"].reset_index(drop=True)
             suffixes_df = self.mods_df[self.mods_df["type"] == "suffix"].reset_index(drop=True)
 
-            # prepare weights (normalized) for both lists; if empty keep None
+            # prepare normalized weights per type
             if len(prefixes_df) > 0:
-                p_w = prefixes_df.get("weight", pd.Series(1, index=prefixes_df.index)).to_numpy(dtype=float)
+                p_w = prefixes_df["weight"].to_numpy(dtype=float)
                 p_w = np.clip(p_w, 0.0, None)
                 if p_w.sum() == 0.0:
                     p_w[:] = 1.0
@@ -50,7 +46,7 @@ class SimulationWorker(threading.Thread):
                 p_w = None
 
             if len(suffixes_df) > 0:
-                s_w = suffixes_df.get("weight", pd.Series(1, index=suffixes_df.index)).to_numpy(dtype=float)
+                s_w = suffixes_df["weight"].to_numpy(dtype=float)
                 s_w = np.clip(s_w, 0.0, None)
                 if s_w.sum() == 0.0:
                     s_w[:] = 1.0
@@ -72,7 +68,6 @@ class SimulationWorker(threading.Thread):
                 totals = np.zeros((current, len(cols)), dtype=float)
 
                 for i, k in enumerate(ks):
-                    # compute valid splits p + s = k with caps of 3
                     max_p = min(3, k)
                     max_s = min(3, k)
                     splits = [(p, k - p) for p in range(0, k + 1) if p <= max_p and (k - p) <= max_s]
@@ -80,27 +75,27 @@ class SimulationWorker(threading.Thread):
 
                     sum_vec = np.zeros(len(cols), dtype=float)
 
-                    # sample prefixes (without replacement) respecting available pool
+                    # select prefixes
                     if prefix_count > 0 and len(prefixes_df) > 0:
                         take = min(prefix_count, len(prefixes_df))
                         if take == len(prefixes_df):
-                            sel = np.arange(len(prefixes_df))
+                            sel_idx = np.arange(len(prefixes_df))
                         else:
-                            sel = rng.choice(len(prefixes_df), size=take, replace=False, p=p_w)
-                        sum_vec += prefixes_df.iloc[sel][cols].sum(axis=0).to_numpy(dtype=float)
+                            # weighted without replacement using probabilities p_w
+                            sel_idx = rng.choice(len(prefixes_df), size=take, replace=False, p=p_w)
+                        sum_vec += prefixes_df.iloc[sel_idx][cols].sum(axis=0).to_numpy(dtype=float)
 
-                    # sample suffixes
+                    # select suffixes
                     if suffix_count > 0 and len(suffixes_df) > 0:
                         take = min(suffix_count, len(suffixes_df))
                         if take == len(suffixes_df):
-                            sel = np.arange(len(suffixes_df))
+                            sel_idx = np.arange(len(suffixes_df))
                         else:
-                            sel = rng.choice(len(suffixes_df), size=take, replace=False, p=s_w)
-                        sum_vec += suffixes_df.iloc[sel][cols].sum(axis=0).to_numpy(dtype=float)
+                            sel_idx = rng.choice(len(suffixes_df), size=take, replace=False, p=s_w)
+                        sum_vec += suffixes_df.iloc[sel_idx][cols].sum(axis=0).to_numpy(dtype=float)
 
                     totals[i, :] = sum_vec
 
-                # count successes where ALL thresholds are met (>=)
                 successes += int((totals >= thresholds_arr).all(axis=1).sum())
                 completed += current
 
@@ -117,14 +112,12 @@ class SimulationWorker(threading.Thread):
             if self.done_callback:
                 self.done_callback(probability, cancelled=False)
 
-        except Exception as e:
+        except Exception as exc:
             if self.done_callback:
-                self.done_callback(e, error=True)
+                self.done_callback(exc, error=True)
 
 
-# -----------------------------
-# Main Tkinter App
-# -----------------------------
+# --- App ---
 class ChaosOrbApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -134,12 +127,11 @@ class ChaosOrbApp(tk.Tk):
         self.mods_df = None
         self.worker = None
         self.stop_event = threading.Event()
+
         self._build_ui()
         self.auto_load_excel()
 
-    # -----------------------------
-    # Auto-load Excel
-    # -----------------------------
+    # --- Auto load ---
     def auto_load_excel(self):
         folder = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(folder, "data.xlsx")
@@ -148,9 +140,7 @@ class ChaosOrbApp(tk.Tk):
         else:
             self.status_var.set("Ready. data.xlsx not found in app folder.")
 
-    # -----------------------------
-    # Load Excel
-    # -----------------------------
+    # --- Load Excel ---
     def load_excel(self, path=None):
         if path is None:
             path = filedialog.askopenfilename(title="Open mods Excel", filetypes=[("Excel files", "*.xlsx *.xls")])
@@ -162,110 +152,168 @@ class ChaosOrbApp(tk.Tk):
             messagebox.showerror("Error", f"Failed to load Excel:\n{e}")
             return
 
-        # required columns and defaults
-        needed = ["mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"]
-        for c in needed:
-            if c not in df.columns:
-                df[c] = 1 if c == "weight" else 0
+        # Normalize column names to make robust to small variations:
+        df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_").str.replace("-", "_")
 
-        # normalize columns
+        # Expected column names after normalization
+        expected = ["mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"]
+        # If some missing, add defaults
+        for col in expected:
+            if col not in df.columns:
+                df[col] = 0 if col != "weight" else 1
+
+        # Ensure mod is string
         df["mod"] = df["mod"].astype(str)
 
-        # type mapping: accept 1/2 or text
-        df["type"] = df["type"].astype(str).str.strip().str.lower()
-        df["type"] = df["type"].replace({"1": "prefix", "2": "suffix", "prefix": "prefix", "suffix": "suffix"})
-        df.loc[~df["type"].isin(["prefix", "suffix"]), "type"] = "prefix"
+        # Map type column: accept numeric 1/2 or textual prefix/suffix
+        def map_type(v):
+            try:
+                # try numeric
+                vn = float(v)
+                if int(vn) == 1:
+                    return "prefix"
+                if int(vn) == 2:
+                    return "suffix"
+            except Exception:
+                pass
+            s = str(v).strip().lower()
+            if "prefix" in s:
+                return "prefix"
+            if "suffix" in s:
+                return "suffix"
+            # default fallback
+            return "prefix"
 
-        # numeric coercion
+        df["type"] = df["type"].apply(map_type)
+
+        # numeric columns coerced
         for c in ["quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"]:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(1 if c == "weight" else 0)
 
-        self.mods_df = df[needed].reset_index(drop=True)
+        # final df with expected column names
+        self.mods_df = df[expected].reset_index(drop=True)
         if "excluded" not in self.mods_df.columns:
             self.mods_df["excluded"] = False
 
         self.populate_tree()
-        self.status_var.set(f"Loaded {len(df)} mods from {os.path.basename(path)}")
+        self.status_var.set(f"Loaded {len(self.mods_df)} mods from {os.path.basename(path)}")
 
-    # -----------------------------
-    # Populate tree
-    # -----------------------------
+    # --- Populate tree (full) ---
     def populate_tree(self):
-        # clear tree
-        for it in self.tree.get_children():
-            self.tree.delete(it)
+        # clear
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
         if self.mods_df is None:
             return
         for i, row in self.mods_df.iterrows():
             mod_display = str(row["mod"]).splitlines()[0]
             excl = "X" if bool(row.get("excluded", False)) else ""
             values = (
-                excl, mod_display, row["type"],
-                str(row["quantity"]), str(row["rarity"]), str(row["pack_size"]),
-                str(row["currency"]), str(row["scarabs"]), str(row["maps"]), str(row["weight"])
+                excl,
+                mod_display,
+                row["type"],
+                f"{row['quantity']}",
+                f"{row['rarity']}",
+                f"{row['pack_size']}",
+                f"{row['currency']}",
+                f"{row['scarabs']}",
+                f"{row['maps']}",
+                f"{row['weight']}",
             )
             self.tree.insert("", "end", iid=str(i), values=values)
-        # bind double click
-        self.tree.bind("<Double-1>", self._on_tree_double_click)
 
+    # --- Double click toggle exclude ---
     def _on_tree_double_click(self, event):
         item = self.tree.identify_row(event.y)
         if not item:
             return
         idx = int(item)
         self.mods_df.at[idx, "excluded"] = not self.mods_df.at[idx, "excluded"]
+        # refresh display for that row
+        excl = "X" if self.mods_df.at[idx, "excluded"] else ""
         curvals = list(self.tree.item(item, "values"))
-        curvals[0] = "X" if self.mods_df.at[idx, "excluded"] else ""
+        curvals[0] = excl
         self.tree.item(item, values=curvals)
 
-    # -----------------------------
-    # Filter logic
-    # -----------------------------
+    # --- Filter ---
     def apply_filter(self):
         txt = self.filter_var.get().strip().lower()
 
-        # If filter is empty → show the full list again
+        # if empty -> restore full list
         if txt == "":
-            self.populate_tree()   # rebuild from original DataFrame
+            self.populate_tree()
             return
 
-        # Otherwise → build only filtered rows
-        self.tree.delete(*self.tree.get_children())
+        # build filtered view
+        # clear tree
+        for iid in list(self.tree.get_children()):
+            self.tree.delete(iid)
 
-        for idx, row in self.mods_df.iterrows():
-            name = row["mod"].splitlines()[0].lower()
+        for i, row in self.mods_df.iterrows():
+            name = str(row["mod"]).splitlines()[0].lower()
             if txt in name:
-                self.tree.insert(
-                    "",
-                    "end",
-                    iid=str(idx),
-                    values=(
-                        row["mod"].splitlines()[0],
-                        row["type"],
-                        row["quantity"],
-                        row["rarity"],
-                        row["packsize"],
-                        row["currency"],
-                        row["scarabs"],
-                        row["maps"],
-                    )
+                excl = "X" if bool(row.get("excluded", False)) else ""
+                values = (
+                    excl,
+                    str(row["mod"]).splitlines()[0],
+                    row["type"],
+                    f"{row['quantity']}",
+                    f"{row['rarity']}",
+                    f"{row['pack_size']}",
+                    f"{row['currency']}",
+                    f"{row['scarabs']}",
+                    f"{row['maps']}",
+                    f"{row['weight']}",
                 )
+                self.tree.insert("", "end", iid=str(i), values=values)
 
+    # --- Sorting helper ---
+    def sort_tree(self, col, descending=False):
+        # gather values
+        data = []
+        for child in self.tree.get_children():
+            val = self.tree.set(child, col)
+            data.append((val, child))
+
+        # attempt numeric sort
+        def try_float(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        numeric = True
+        for v, _ in data:
+            if try_float(v) is None:
+                numeric = False
+                break
+
+        if numeric:
+            data.sort(key=lambda t: float(t[0]), reverse=descending)
+        else:
+            data.sort(key=lambda t: t[0].lower(), reverse=descending)
+
+        # rearrange
+        for index, (_, iid) in enumerate(data):
+            self.tree.move(iid, "", index)
+
+        # toggle next time
+        self.tree.heading(col, command=lambda: self.sort_tree(col, not descending))
+
+    # --- Clear exclusions ---
     def clear_exclusions(self):
         if self.mods_df is None:
             return
         self.mods_df["excluded"] = False
-        # refresh display to clear marks
         self.populate_tree()
 
+    # --- Get filtered mods as DataFrame ---
     def get_filtered_mods(self):
         if self.mods_df is None:
             return pd.DataFrame(columns=["mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"])
         return self.mods_df[~self.mods_df["excluded"]].reset_index(drop=True)
 
-    # -----------------------------
-    # Build UI
-    # -----------------------------
+    # --- UI build ---
     def _build_ui(self):
         top = ttk.Frame(self)
         top.pack(side="top", fill="x", padx=8, pady=8)
@@ -287,7 +335,8 @@ class ChaosOrbApp(tk.Tk):
         filter_frame.pack(side="top", fill="x", pady=(0, 6))
         ttk.Label(filter_frame, text="Filter mods by name:").pack(side="left")
         self.filter_var = tk.StringVar()
-        self.filter_var.trace("w", lambda *_: self.apply_filter())
+        # use trace_add for newer tkinter
+        self.filter_var.trace_add("write", lambda *_: self.apply_filter())
         self.filter_entry = ttk.Entry(filter_frame, textvariable=self.filter_var, width=30)
         self.filter_entry.pack(side="left", padx=(6, 0))
         self.clear_exclusions_btn = ttk.Button(filter_frame, text="Clear Exclusions", command=self.clear_exclusions)
@@ -296,11 +345,13 @@ class ChaosOrbApp(tk.Tk):
         cols = ("Exclude", "Mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight")
         self.tree = ttk.Treeview(left_frame, columns=cols, show="headings", selectmode="browse")
         for c in cols:
-            self.tree.heading(c, text=c)
+            # set heading with sort command (click to sort)
+            self.tree.heading(c, text=c, command=lambda _c=c: self.sort_tree(_c, False))
             if c == "Mod":
-                self.tree.column(c, width=360, anchor="w")  # left-align mod name
+                self.tree.column(c, width=360, anchor="w")
             else:
                 self.tree.column(c, width=90, anchor="center")
+
         vsb = ttk.Scrollbar(left_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -341,15 +392,16 @@ class ChaosOrbApp(tk.Tk):
         status_label = ttk.Label(self, textvariable=self.status_var, anchor="w")
         status_label.pack(side="bottom", fill="x", padx=8, pady=6)
 
-    # -----------------------------
-    # Simulation flow
-    # -----------------------------
+        # bind double click now (tree items will be inserted later)
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+
+    # --- Run simulation ---
     def run_simulation(self):
         if self.mods_df is None:
             messagebox.showwarning("No data", "Please load an Excel file before running.")
             return
 
-        # parse thresholds (user may leave some as 0)
+        # parse thresholds
         try:
             thresholds = {k: float(v.get()) for k, v in self.threshold_vars.items()}
         except Exception:
@@ -403,6 +455,7 @@ class ChaosOrbApp(tk.Tk):
             self.result_label.config(text=f"Estimated probability per Chaos Orb roll: {prob_pct:.3f}%\nAverage Chaos Orbs Needed (expected): {avg}")
         self.after(0, ui_update)
 
+    # --- Save filtered mods ---
     def save_filtered_mods(self):
         df = self.get_filtered_mods()
         if df.empty:
@@ -417,18 +470,8 @@ class ChaosOrbApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save file:\n{e}")
 
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    def get_filtered_mods(self):
-        if self.mods_df is None:
-            return pd.DataFrame(columns=["mod", "type", "quantity", "rarity", "pack_size", "currency", "scarabs", "maps", "weight"])
-        return self.mods_df[~self.mods_df["excluded"]].reset_index(drop=True)
 
-
-# -----------------------------
-# Entry point
-# -----------------------------
+# --- Entry point ---
 def main():
     app = ChaosOrbApp()
     app.mainloop()
